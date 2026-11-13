@@ -1,0 +1,12 @@
+# Git ignore — don't commit secrets or cache to GitHub
+.env
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
