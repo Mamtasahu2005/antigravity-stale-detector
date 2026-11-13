@@ -138,6 +138,15 @@ TAVILY_KEY  = "tvly-your-key"
 `app.py` reads Streamlit secrets first, then environment variables, so the same
 code works locally, on Streamlit Cloud, and in Docker.
 
+**3. Verify both keys before recording the demo**
+
+```powershell
+$env:BIFROST_URL = "https://antigravity-bifrost.onrender.com"
+$env:BIFROST_KEY = ""                 # only if auth is enabled
+$env:TAVILY_KEY  = "tvly-your-key"
+python check_keys.py
+```
+
 ---
 
 ## 📊 Verdict Legend
