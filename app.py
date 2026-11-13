@@ -1,16 +1,39 @@
 import streamlit as st
 import requests
 import json
+import os
 import re
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
+
+def utcnow():
+    """timezone-aware UTC datetime (replaces deprecated utcnow())"""
+    return datetime.now(timezone.utc)
+
+
+def get_setting(name: str, default: str = "") -> str:
+    """
+    Read a config value from Streamlit secrets first, then environment vars.
+
+    This is what makes the same code work in three places:
+      - Streamlit Cloud  -> st.secrets (dashboard -> App settings -> Secrets)
+      - Docker / Render  -> environment variables
+      - Local dev        -> sidebar inputs (secrets/env are just the defaults)
+    """
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        # No secrets.toml locally -- totally fine.
+        pass
+    return os.environ.get(name, default)
 
 # =============================================================================
 # PAGE CONFIG
 # =============================================================================
 st.set_page_config(
     page_title="Antigravity -- Stale Answer Detector",
-    page_icon="[ship]",
+    page_icon="🛸",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -161,14 +184,15 @@ with st.sidebar:
     # (Groq, OpenAI, Anthropic...) with virtual keys and auto-fallback.
     bifrost_key = st.text_input(
         "Bifrost API Key",
+        value=get_setting("BIFROST_KEY"),
         type="password",
-        placeholder="bf-xxxx...",
-        help="Get yours FREE at getmaxim.ai -> Settings -> API Keys"
+        placeholder="sk-bf-xxxx...",
+        help="Virtual key from your Bifrost gateway (starts with sk-bf-). Leave empty if auth is disabled."
     )
     bifrost_url = st.text_input(
         "Bifrost Base URL",
-        value="http://localhost:8080",
-        help="Your Bifrost gateway URL. Run locally with: docker run maximhq/bifrost"
+        value=get_setting("BIFROST_URL", "http://localhost:8080"),
+        help="Public gateway URL (no trailing slash). Local: http://localhost:8080"
     )
 
     # --- Tavily settings ---
@@ -177,6 +201,7 @@ with st.sidebar:
     # making it much easier to feed into an LLM than Google Search.
     tavily_key = st.text_input(
         "Tavily API Key",
+        value=get_setting("TAVILY_KEY"),
         type="password",
         placeholder="tvly-xxxx...",
         help="Free 1,000 credits/month at app.tavily.com -- no credit card!"
@@ -185,18 +210,18 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("#### Model Settings")
 
-    # We use TWO models via Bifrost:
+    # Bifrost routes by "provider/model", so the provider prefix is required.
     # 1. Fast/cheap model for claim extraction (doesn't need to be smart)
     # 2. Accurate model for judgment (needs to reason about evidence)
     extractor_model = st.selectbox(
         "Extractor Model (fast)",
-        ["llama-3.1-8b-instant", "gemini-1.5-flash", "claude-haiku-5-5"],
+        ["groq/llama-3.1-8b-instant", "openai/gpt-4o-mini"],
         index=0,
         help="Fast, cheap model -- just extracts claims, no deep reasoning needed"
     )
     judge_model = st.selectbox(
         "Judge Model (accurate)",
-        ["llama-3.3-70b-versatile", "gemini-1.5-pro", "claude-sonnet-5-5"],
+        ["groq/llama-3.3-70b-versatile", "openai/gpt-4o"],
         index=0,
         help="Stronger model -- compares claim to live evidence and reasons about it"
     )
@@ -241,10 +266,14 @@ def call_bifrost(prompt: str, model: str, system: str = "") -> str:
     """
     headers = {
         "Content-Type": "application/json",
-        "x-bf-provider": "groq",  # Route this call to Groq's inference API
     }
     if bifrost_key:
-        headers["Authorization"] = f"Bearer {bifrost_key}"
+        # Modern Bifrost virtual keys (sk-bf-...) go in x-bf-vk.
+        # Older deployments / plain OpenAI-compatible gateways accept Bearer.
+        if bifrost_key.startswith("sk-bf-"):
+            headers["x-bf-vk"] = bifrost_key
+        else:
+            headers["Authorization"] = f"Bearer {bifrost_key}"
 
     messages = []
     if system:
@@ -252,7 +281,7 @@ def call_bifrost(prompt: str, model: str, system: str = "") -> str:
     messages.append({"role": "user", "content": prompt})
 
     payload = {
-        "model": model,
+        "model": model,  # Bifrost expects "provider/model", e.g. groq/llama-3.1-8b-instant
         "messages": messages,
         "max_tokens": 1500,
         "temperature": 0.1,  # Low temp = consistent, structured JSON output
@@ -260,10 +289,10 @@ def call_bifrost(prompt: str, model: str, system: str = "") -> str:
 
     try:
         resp = requests.post(
-            f"{bifrost_url}/v1/chat/completions",
+            f"{bifrost_url.rstrip('/')}/v1/chat/completions",
             headers=headers,
             json=payload,
-            timeout=30
+            timeout=60  # generous: free-tier gateways can cold-start
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
@@ -286,12 +315,16 @@ def search_tavily(query: str, days: int = 400) -> dict:
     if not tavily_key:
         return {"error": "No Tavily API key -- configure in sidebar", "results": []}
 
+    # Tavily's `days` filter only works with topic="news". For general search the
+    # supported recency knob is time_range: day | week | month | year.
+    time_range = "day" if days <= 1 else "week" if days <= 7 else "month" if days <= 31 else "year"
+
     payload = {
         "api_key": tavily_key,
         "query": query,
         "search_depth": "basic",   # basic = 1 Tavily credit; advanced = 2 credits
         "max_results": 3,          # Top 3 results per claim
-        "days": days,              # Only look at pages updated in the last N days
+        "time_range": time_range,  # Prefer recent sources (max granularity = 1 year)
         "include_answer": True,    # Get a synthesized answer, not just raw snippets
     }
     try:
@@ -376,7 +409,8 @@ def verify_claim(claim: str, claim_type: str) -> dict:
     Returns: {status, evidence, source_url, corrected_fact}
     """
     # --- Step 1: Get live evidence from Tavily ---
-    search_result = search_tavily(f"{claim} {claim_type} 2024 2025 2026", days=400)
+    year = utcnow().year
+    search_result = search_tavily(f"{claim} {claim_type} latest {year}", days=400)
 
     tavily_evidence = ""
     source_url = ""
@@ -561,9 +595,9 @@ def score_color(score: int) -> str:
 
 
 def score_label(score: int) -> str:
-    if score >= 75: return "Fresh [check]"
-    if score >= 45: return "Needs Review [warning]"
-    return "Stale [cross]"
+    if score >= 75: return "Fresh ✅"
+    if score >= 45: return "Needs Review ⚠️"
+    return "Stale ❌"
 
 
 def confidence_bar_html(status: str) -> str:
@@ -690,16 +724,16 @@ with tab_text:
             help="Pre-fills a stale AI answer and runs the full analysis"
         )
 
-    # Pre-fill the text area
-    default_val = ""
+    # Pre-fill the text area. Streamlit ignores `value=` once a widget key exists,
+    # so write to session_state BEFORE the widget is created.
     if quick_demo:
-        default_val = DEMO_TEXT
-    elif example_pick != "— choose —":
-        default_val = TEXT_EXAMPLES[example_pick]
+        st.session_state["answer_input"] = DEMO_TEXT
+    elif example_pick != "— choose —" and st.session_state.get("_last_example") != example_pick:
+        st.session_state["answer_input"] = TEXT_EXAMPLES[example_pick]
+    st.session_state["_last_example"] = example_pick
 
     answer_input = st.text_area(
         "AI Answer",
-        value=default_val,
         height=160,
         placeholder=(
             "Paste any AI-generated answer here...\n"
@@ -753,7 +787,7 @@ with tab_text:
 
         # Save to session history (shown in sidebar)
         st.session_state.history.append({
-            "ts": datetime.utcnow().strftime("%H:%M UTC"),
+            "ts": utcnow().strftime("%H:%M UTC"),
             "score": score,
             "label": label,
             "claims_count": len(results),
@@ -810,7 +844,7 @@ with tab_text:
         exp_col, tweet_col = st.columns([1, 2])
 
         export_data = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": utcnow().isoformat() + "Z",
             "freshness_score": score,
             "summary": label,
             "powered_by": "Bifrost (Maxim AI) + Tavily",
@@ -820,7 +854,7 @@ with tab_text:
             st.download_button(
                 "⬇️ Export Report (JSON)",
                 data=json.dumps(export_data, indent=2),
-                file_name=f"antigravity_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json",
+                file_name=f"antigravity_report_{utcnow().strftime('%Y%m%d_%H%M%S')}.json",
                 mime="application/json"
             )
 
@@ -879,11 +913,13 @@ with tab_code:
             "Load example", ["— choose —"] + list(CODE_EXAMPLES.keys()), key="code_ex"
         )
 
-    code_default = CODE_EXAMPLES.get(code_example, "") if code_example != "— choose —" else ""
+    # Same session_state trick as Text Mode: update the key before the widget exists.
+    if code_example != "— choose —" and st.session_state.get("_last_code_example") != code_example:
+        st.session_state["code_input"] = CODE_EXAMPLES[code_example]
+    st.session_state["_last_code_example"] = code_example
 
     code_input = st.text_area(
         "Code snippet",
-        value=code_default,
         height=200,
         placeholder=(
             "Paste Python code or requirements.txt here...\n\n"
@@ -977,7 +1013,7 @@ with tab_code:
         # --- Export ---
         st.markdown("---")
         code_export = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": utcnow().isoformat() + "Z",
             "library_freshness_score": code_score,
             "total_packages": len(code_results),
             "outdated": stale_n_c,
@@ -988,7 +1024,7 @@ with tab_code:
         st.download_button(
             "⬇️ Export Code Report (JSON)",
             data=json.dumps(code_export, indent=2),
-            file_name=f"antigravity_code_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json",
+            file_name=f"antigravity_code_{utcnow().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json"
         )
 

@@ -29,9 +29,9 @@ Antigravity is the solution.
 
 ## ✨ What It Does
 
-1. **Extract** — Bifrost routes to a fast LLM (llama-3.1-8b) that pulls _only_ time-sensitive claims
+1. **Extract** — Bifrost routes to a fast LLM (`groq/llama-3.1-8b-instant`) that pulls _only_ time-sensitive claims
 2. **Search** — Tavily searches the live web for real evidence per claim with source URLs
-3. **Judge** — A stronger LLM (llama-3.3-70b via Bifrost) compares claim to evidence
+3. **Judge** — A stronger LLM (`groq/llama-3.3-70b-versatile` via Bifrost) compares claim to evidence
 4. **Score** — A 0–100 Freshness Score tells you how much to trust the answer
 5. **Code Mode** — Paste Python code; checks every library version against PyPI live
 
@@ -45,19 +45,19 @@ User Input (AI Answer or Code Snippet)
            ▼
   ┌─────────────────────┐
   │   Bifrost Gateway   │◄── Provider: Groq | Fallback: auto
-  │  Claim Extractor    │    Model: llama-3.1-8b-instant (fast)
+  │  Claim Extractor    │    Model: groq/llama-3.1-8b-instant (fast)
   └─────────────────────┘
            │
            ▼  [list of time-sensitive claims]
   ┌─────────────────────┐
-  │   Tavily Search     │◄── Live web, max_results=3, days=400
+  │   Tavily Search     │◄── Live web, max_results=3, time_range=year
   │   (Per claim)       │    Returns: URL + snippet + synthesized answer
   └─────────────────────┘
            │
            ▼  [live evidence]
   ┌─────────────────────┐
   │   Bifrost Gateway   │◄── Provider: Groq | Fallback: auto
-  │   Judge LLM         │    Model: llama-3.3-70b-versatile (accurate)
+  │   Judge LLM         │    Model: groq/llama-3.3-70b-versatile (accurate)
   └─────────────────────┘
            │
            ▼
@@ -86,7 +86,10 @@ cd antigravity-stale-detector
 # 2. Install
 pip install -r requirements.txt
 
-# 3. Run
+# 3. Start Bifrost locally (free Groq key from console.groq.com/keys)
+docker run -p 8080:8080 -e GROQ_API_KEY=gsk_your_key maximhq/bifrost
+
+# 4. Run the app
 streamlit run app.py
 # → Open http://localhost:8501
 ```
@@ -95,9 +98,45 @@ streamlit run app.py
 
 | Field | Where to get it |
 |-------|----------------|
-| Bifrost API Key | [getmaxim.ai](https://www.getmaxim.ai) → Settings → API Keys |
-| Bifrost Base URL | `http://localhost:8080` (self-hosted) or your gateway URL |
+| Bifrost Base URL | `http://localhost:8080` locally, or your Render URL |
+| Bifrost API Key | Optional — only if `enforce_auth_on_inference` is enabled (`sk-bf-...`) |
 | Tavily API Key | [app.tavily.com](https://app.tavily.com) — free, no credit card |
+| Groq API key | [console.groq.com/keys](https://console.groq.com/keys) — free, used by Bifrost |
+
+> Bifrost is self-hosted (there is no vendor SaaS gateway), so a cloud deployment
+> needs a public gateway URL. `render.yaml` in this repo deploys one in ~5 minutes.
+
+---
+
+## ☁️ Deploy (free tier)
+
+**1. Deploy Bifrost to Render**
+
+1. Push this repo to GitHub (already done).
+2. Render Dashboard → **New → Blueprint** → select this repo → **Apply**.
+3. When prompted, paste your `GROQ_API_KEY`.
+4. Copy the service URL, e.g. `https://antigravity-bifrost.onrender.com`.
+   Verify it: `curl https://antigravity-bifrost.onrender.com/health`
+
+> Render's free tier sleeps after ~15 minutes idle. The first request can take
+> 30–60 seconds (the app's Bifrost timeout is 60s and it falls back to regex
+> extraction if the gateway is still cold).
+
+**2. Deploy the UI to Streamlit Cloud**
+
+1. [share.streamlit.io](https://share.streamlit.io) → **New app** → pick this repo.
+2. Main file: `app.py` · Branch: `main`.
+3. **Advanced settings → Python 3.12**.
+4. **Secrets** — paste (top-level keys, no `[secrets]` section):
+
+```toml
+BIFROST_URL = "https://antigravity-bifrost.onrender.com"
+BIFROST_KEY = ""
+TAVILY_KEY  = "tvly-your-key"
+```
+
+`app.py` reads Streamlit secrets first, then environment variables, so the same
+code works locally, on Streamlit Cloud, and in Docker.
 
 ---
 
@@ -128,10 +167,17 @@ streamlit run app.py
 
 ```
 antigravity/
-├── app.py              # Main Streamlit application
-├── requirements.txt    # Python dependencies
-├── .env.example        # Environment variable template
-└── README.md           # This file
+├── app.py                       # Main Streamlit application
+├── requirements.txt             # Python dependencies
+├── render.yaml                  # One-click Bifrost gateway deploy (Render)
+├── bifrost/
+│   ├── Dockerfile               # Bifrost image + file-only config
+│   └── config.json              # Groq provider, no database needed
+├── .streamlit/
+│   ├── config.toml              # Dark theme
+│   └── secrets.toml.example     # Cloud secrets template
+├── .env.example                 # Local environment template
+└── README.md
 ```
 
 ---

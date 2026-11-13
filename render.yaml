@@ -1,0 +1,24 @@
+# Render Blueprint -- deploys the Bifrost gateway that the Streamlit app calls.
+# Dashboard: New -> Blueprint -> connect this repo -> Apply.
+services:
+  - type: web
+    name: antigravity-bifrost
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./bifrost/Dockerfile
+    dockerContext: ./bifrost
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: APP_HOST
+        value: 0.0.0.0
+      - key: APP_PORT
+        value: 10000
+      - key: PORT
+        value: 10000
+      - key: BIFROST_ENCRYPTION_KEY
+        generateValue: true
+      # Paste your free Groq key from https://console.groq.com/keys
+      - key: GROQ_API_KEY
+        sync: false
